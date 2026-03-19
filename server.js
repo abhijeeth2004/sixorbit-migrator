@@ -298,19 +298,13 @@ app.post('/api/templates/list', async (req, res) => {
 // Each call launches a FRESH isolated browser instance (like incognito)
 // This is critical for same-URL migrations where company switching must be independent
 async function launchIsolatedBrowser() {
-  const args = [
-    '--no-sandbox', '--disable-setuid-sandbox',
-    '--disable-dev-shm-usage', '--disable-gpu',
-    '--disable-software-rasterizer',
-    '--incognito'
-  ];
-  // On Railway/Linux, use system Chromium if available
-  const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH ||
-    (process.platform === 'linux' ? '/usr/bin/chromium' : undefined);
   return await puppeteer.launch({
     headless: true,
-    args,
-    ...(executablePath ? { executablePath } : {})
+    args: [
+      '--no-sandbox', '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage', '--disable-gpu',
+      '--incognito'  // Extra isolation
+    ]
   });
 }
 
@@ -1119,8 +1113,6 @@ document.getElementById('f').onsubmit = async (e) => {
   const d = await r.json();
   document.getElementById('out').textContent = JSON.stringify(d.info, null, 2);
 };
-
-
 </script>
 </body></html>`);
 });
@@ -1468,299 +1460,10 @@ document.getElementById('f').onsubmit = async (e) => {
 </script></body></html>`);
 });
 
+app.get('/', (req, res) => res.send(HTML));
 
-// ── PERMISSIONS: Get roles list ───────────────────────────────────────────────
-app.post('/api/permissions/roles', async (req, res) => {
-  const { serverUrl, cookies } = req.body;
-  try {
-    const base = baseUrl(serverUrl);
-    const resp = await httpGet(`${base}/?urlq=admin_user/role`, cookies);
-    // Parse roles from DataTable page - use Puppeteer
-    let page;
-    try {
-      page = await newPage(serverUrl, cookies);
-      await page.goto(`${base}/?urlq=admin_user/permission/view`, { waitUntil: 'networkidle2', timeout: 20000 });
-      await wait(2000);
-      const roles = await page.evaluate(() => {
-        // Roles are the column headers in the permission table
-        const headers = document.querySelectorAll('table thead th, .permission-table th');
-        const roles = [];
-        headers.forEach((th, i) => {
-          if (i === 0) return; // skip "Permission" column
-          const text = th.textContent?.trim();
-          const roleId = th.getAttribute('data-role-id') || th.getAttribute('data-id') || '';
-          if (text && text !== 'PERMISSION') roles.push({ id: roleId, name: text });
-        });
-        // Also try from role manage page
-        if (!roles.length) {
-          document.querySelectorAll('#role-list-table tbody tr, table tbody tr').forEach(tr => {
-            const cells = tr.querySelectorAll('td');
-            if (cells.length >= 2) {
-              const name = cells[1]?.textContent?.trim() || cells[0]?.textContent?.trim();
-              const id = tr.getAttribute('data-id') || '';
-              if (name && id) roles.push({ id, name });
-            }
-          });
-        }
-        return roles;
-      });
-      // Get roles from the role management page for IDs
-      await page.goto(`${base}/?urlq=admin_user/role`, { waitUntil: 'networkidle2', timeout: 20000 });
-      await wait(2000);
-      const rolesWithIds = await page.evaluate(() => {
-        const roles = [];
-        document.querySelectorAll('table tbody tr').forEach(tr => {
-          const cells = tr.querySelectorAll('td');
-          if (cells.length < 2) return;
-          // Find edit link to get ID
-          const editLink = tr.querySelector('a[href*="edit"], a[href*="role"]');
-          const href = editLink?.getAttribute('href') || '';
-          const idMatch = href.match(/\/([0-9]+)/) || href.match(/id=([0-9]+)/);
-          const id = idMatch ? idMatch[1] : tr.getAttribute('data-id') || '';
-          const name = cells[1]?.textContent?.trim() || cells[0]?.textContent?.trim();
-          if (name && id) roles.push({ id, name });
-        });
-        return roles;
-      });
-      res.json({ success: true, roles: rolesWithIds.length ? rolesWithIds : roles });
-    } finally {
-      if (page?._ctx) await page._ctx.close().catch(() => {});
-      if (page?._browser) await page._browser.close().catch(() => {});
-    }
-  } catch(e) {
-    res.json({ success: false, error: e.message });
-  }
-});
-
-// ── PERMISSIONS: Read all permissions for all roles ───────────────────────────
-app.post('/api/permissions/read', async (req, res) => {
-  const { serverUrl, cookies, company } = req.body;
-  let page;
-  try {
-    const base = baseUrl(serverUrl);
-    page = await newPage(serverUrl, cookies);
-    if (company) await switchCompany(page, base, company, () => {});
-    await page.goto(`${base}/?urlq=admin_user/permission/view`, { waitUntil: 'networkidle2', timeout: 20000 });
-    await wait(2000);
-
-    // Read permissions: mapping is [perm_id, role_id] pairs
-    // Also get role names from column headers
-    const data = await page.evaluate(() => {
-      const result = { roles: [], permissions: [], mapping: [] };
-
-      // Get role IDs and names from column headers
-      const headers = document.querySelectorAll('table thead th');
-      headers.forEach((th, i) => {
-        if (i === 0) return;
-        const roleId = th.getAttribute('data-role-id') || th.getAttribute('data-id') || String(i);
-        const name = th.textContent?.trim();
-        if (name) result.roles.push({ id: roleId, name, colIndex: i });
-      });
-
-      // Get all checked checkboxes — each has data-pid (permission id) and data-rid (role id)
-      document.querySelectorAll('input[type="checkbox"]:checked').forEach(cb => {
-        const pid = cb.getAttribute('data-pid') || cb.getAttribute('data-permission-id') || cb.name;
-        const rid = cb.getAttribute('data-rid') || cb.getAttribute('data-role-id');
-        if (pid && rid) result.mapping.push([pid, rid]);
-      });
-
-      // Also get all permission IDs that are checked (pids[])
-      document.querySelectorAll('input[type="checkbox"]:checked').forEach(cb => {
-        const pid = cb.getAttribute('data-pid') || cb.value;
-        if (pid && !result.permissions.includes(pid)) result.permissions.push(pid);
-      });
-
-      return result;
-    });
-
-    // If no data from attributes, try Puppeteer-based approach by clicking Save and intercepting
-    if (!data.mapping.length) {
-      // Intercept the save POST to get the actual mapping
-      const [saveResp] = await Promise.all([
-        page.waitForResponse(r => r.url().includes('admin_user/permission') && r.request().method() === 'POST', { timeout: 8000 }).catch(() => null),
-        page.evaluate(() => {
-          const btn = document.querySelector('button[type="submit"], input[type="submit"], .btn-primary');
-          if (btn) btn.click();
-        })
-      ]);
-      if (saveResp) {
-        const postData = saveResp.request().postData() || '';
-        // Parse mapping from POST data
-        const mappingMatch = postData.match(/mapping=([^&]+)/);
-        if (mappingMatch) {
-          try {
-            data.mappingRaw = decodeURIComponent(mappingMatch[1]);
-            const parsed = JSON.parse(data.mappingRaw);
-            data.mapping = parsed;
-          } catch(e) {}
-        }
-        const pidsMatches = [...postData.matchAll(/pids\[\]=(\d+)/g)];
-        data.permissions = pidsMatches.map(m => m[1]);
-      }
-    }
-
-    res.json({ success: true, data });
-  } catch(e) {
-    res.json({ success: false, error: e.message });
-  } finally {
-    if (page?._ctx) await page._ctx.close().catch(() => {});
-    if (page?._browser) await page._browser.close().catch(() => {});
-  }
-});
-
-// ── PERMISSIONS: Migrate permissions ──────────────────────────────────────────
-app.post('/api/permissions/migrate', async (req, res) => {
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-
-  const emit = (level, msg) => res.write(`data: ${JSON.stringify({ type: 'log', level, msg })}\n\n`);
-  const done = (ok, fail) => res.write(`data: ${JSON.stringify({ type: 'done', ok, fail })}\n\n`);
-
-  const { srcUrl, srcCookies, dstUrl, dstCookies, srcCompany, dstCompany, roleMappings } = req.body;
-  // roleMappings: [{srcRoleId, srcRoleName, dstRoleId, dstRoleName, createNew}]
-
-  let srcPage, dstPage;
-  try {
-    const srcBase = baseUrl(srcUrl);
-    const dstBase = baseUrl(dstUrl);
-
-    // Phase 1: Read permissions from source
-    emit('info', '🔗 Reading source permissions...');
-    srcPage = await newPage(srcUrl, srcCookies);
-    if (srcCompany) await switchCompany(srcPage, srcBase, srcCompany, (m) => emit('info', m));
-
-    await srcPage.goto(`${srcBase}/?urlq=admin_user/permission/view`, { waitUntil: 'networkidle2', timeout: 20000 });
-    await wait(2000);
-
-    // Read ALL permissions across ALL modules by intercepting the Save POST
-    // WITHOUT actually sending to server (override fetch to capture data)
-    emit('info', '  ↳ Reading all permissions across all modules...');
-    const captured = await srcPage.evaluate(() => {
-      return new Promise((resolve) => {
-        const origFetch = window.fetch;
-        // Override fetch to capture the form data without sending
-        window.fetch = async function(url, opts) {
-          if (url && url.toString().includes('admin_user/permission') && opts && opts.method === 'POST') {
-            window.fetch = origFetch; // restore immediately
-            resolve({ body: opts.body ? opts.body.toString() : '' });
-            // Return fake success so page JS doesn't break
-            return new Response(JSON.stringify({success:true, status:'success'}),
-              { status:200, headers:{'Content-Type':'application/json'} });
-          }
-          return origFetch.call(window, url, opts);
-        };
-        // Override jQuery AJAX too
-        if (window.$ && window.$.ajax) {
-          const origAjax = window.$.ajax;
-          window.$.ajax = function(opts2) {
-            if (opts2 && opts2.url && opts2.url.includes('admin_user/permission') && opts2.type === 'POST') {
-              window.$.ajax = origAjax;
-              const body = opts2.data ? (typeof opts2.data === 'string' ? opts2.data : JSON.stringify(opts2.data)) : '';
-              resolve({ body });
-              if (opts2.success) opts2.success({success:true});
-              return;
-            }
-            return origAjax.apply(window.$, arguments);
-          };
-        }
-        // Click Save
-        const btn = document.querySelector('button[type="submit"], button.btn-success, .btn-primary');
-        if (btn) btn.click(); else resolve(null);
-        setTimeout(() => resolve(null), 8000);
-      });
-    });
-
-    let srcMapping = [];
-    let srcPids = [];
-    if (captured && captured.body) {
-      emit('info', `  ↳ Captured ${captured.body.length} bytes`);
-      try {
-        const params = new URLSearchParams(captured.body);
-        const mappingStr = params.get('mapping');
-        if (mappingStr) srcMapping = JSON.parse(mappingStr);
-        srcPids = params.getAll('pids[]');
-      } catch(e) {
-        emit('info', `  ↳ Parse error: ${e.message}`);
-      }
-    }
-    emit('info', `  ↳ Found ${srcMapping.length} permission mappings across ALL modules`);
-
-    // Close source
-    if (srcPage?._ctx) await srcPage._ctx.close().catch(() => {});
-    if (srcPage?._browser) await srcPage._browser.close().catch(() => {});
-    srcPage = null;
-
-    // Phase 2: Write to destination
-    emit('info', '🔗 Opening destination...');
-    dstPage = await newPage(dstUrl, dstCookies);
-    if (dstCompany) await switchCompany(dstPage, dstBase, dstCompany, (m) => emit('info', m));
-
-    let ok = 0, fail = 0;
-
-    for (const rm of roleMappings) {
-      emit('info', `\n→ Migrating: "${rm.srcRoleName}" → "${rm.dstRoleName}"`);
-
-      let dstRoleId = rm.dstRoleId;
-
-      // Create role if needed
-      if (rm.createNew) {
-        emit('info', `  ↳ Creating new role: "${rm.dstRoleName}"`);
-        const created = await dstPage.evaluate(async (base, roleName) => {
-          const fd = new URLSearchParams({ role: roleName, submit: 'add-role-submit' });
-          const r = await fetch(`${base}/?urlq=admin_user/role/add`, {
-            method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: fd.toString(), credentials: 'include'
-          });
-          const text = await r.text();
-          try { const j = JSON.parse(text); return j; } catch(e) { return { raw: text.substring(0, 200) }; }
-        }, dstBase, rm.dstRoleName);
-        emit('info', `  ↳ Create result: ${JSON.stringify(created).substring(0, 100)}`);
-        if (created.id || created.role_id) dstRoleId = String(created.id || created.role_id);
-      }
-
-      // Filter mapping for this source role, remap to destination role ID
-      const rolePairs = srcMapping.filter(m => String(m[1]) === String(rm.srcRoleId));
-      const remapped = rolePairs.map(m => [m[0], dstRoleId]);
-      const rolePids = [...new Set(rolePairs.map(m => String(m[0])))];
-
-      emit('info', `  ↳ ${rolePairs.length} permissions to copy`);
-
-      // POST to destination
-      const result = await dstPage.evaluate(async (base, mapping, pids) => {
-        const fd = new URLSearchParams();
-        fd.append('mapping', JSON.stringify(mapping));
-        pids.forEach(pid => fd.append('pids[]', pid));
-        fd.append('submit', 'admin-user-permission-role-map-submit');
-        const r = await fetch(`${base}/?urlq=admin_user/permission`, {
-          method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: fd.toString(), credentials: 'include'
-        });
-        const text = await r.text();
-        try { const j = JSON.parse(text); return j; } catch(e) { return { raw: text.substring(0, 100) }; }
-      }, dstBase, remapped, rolePids);
-
-      if (result.success || result.status === 'success') {
-        emit('success', `  ✅ Done: "${rm.srcRoleName}" → "${rm.dstRoleName}"`);
-        ok++;
-      } else {
-        emit('error', `  ❌ Failed: ${JSON.stringify(result).substring(0, 100)}`);
-        fail++;
-      }
-    }
-
-    done(ok, fail);
-  } catch(e) {
-    emit('error', `Fatal: ${e.message}`);
-    done(0, roleMappings?.length || 0);
-  } finally {
-    if (srcPage?._ctx) await srcPage._ctx.close().catch(() => {});
-    if (srcPage?._browser) await srcPage._browser.close().catch(() => {});
-    if (dstPage?._ctx) await dstPage._ctx.close().catch(() => {});
-    if (dstPage?._browser) await dstPage._browser.close().catch(() => {});
-    res.end();
-  }
-});
+const PORT = process.env.PORT || 3737;
+app.listen(PORT, () => console.log(`\n  Sixorbit Migrator v6.0 → http://localhost:${PORT}\n`));
 
 // ── HTML UI ───────────────────────────────────────────────────────────────────
 const HTML = `<!DOCTYPE html>
@@ -1776,8 +1479,6 @@ const HTML = `<!DOCTYPE html>
 .topbar{display:flex;align-items:center;gap:12px;margin-bottom:28px;padding-bottom:18px;border-bottom:1px solid var(--bdr)}
 .logo{width:40px;height:40px;background:linear-gradient(135deg,#0a7aff,#0055cc);border-radius:10px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:20px;flex-shrink:0}
 .brand{font-size:19px;font-weight:600}.brand b{color:var(--src)}
-.modeBtn{flex:1;padding:20px;border:2px solid var(--bdr);border-radius:12px;background:var(--surf);cursor:pointer;font:600 15px/1.4 'DM Sans',sans-serif;color:var(--mut);display:flex;flex-direction:column;align-items:center;gap:8px;transition:all .2s}
-.modeBtn.on{border-color:var(--src);background:#f0f6ff;color:var(--src)}
 .ver{font-size:11px;color:var(--mut);margin-left:auto;font-family:'DM Mono',monospace;background:#f0f2f7;padding:4px 10px;border-radius:20px;border:1px solid var(--bdr)}
 .steps{display:flex;background:var(--surf);border:1px solid var(--bdr);border-radius:var(--r);padding:4px;width:fit-content;margin-bottom:24px;box-shadow:var(--sh)}
 .st{display:flex;align-items:center;gap:7px;padding:9px 18px;border-radius:7px;border:none;background:transparent;cursor:pointer;font:500 13px 'DM Sans',sans-serif;color:var(--mut);white-space:nowrap;transition:all .2s}
@@ -1846,20 +1547,6 @@ const HTML = `<!DOCTYPE html>
   <div class="brand"><b>Sixorbit</b> Template Migrator</div>
   <div class="ver">v6.0</div>
 </div>
-<!-- Mode selector -->
-<div id="modeSelect" style="display:flex;gap:16px;margin-bottom:24px">
-  <button onclick="setMode('print')" id="modePrint" class="modeBtn on">
-    <span style="font-size:28px">🖨️</span>Print Template Migration
-    <span style="font-size:12px;font-weight:400;color:var(--mut)">Copy print templates between companies/servers</span>
-  </button>
-  <button onclick="setMode('perm')" id="modePerm" class="modeBtn">
-    <span style="font-size:28px">🔐</span>User Permission Migration
-    <span style="font-size:12px;font-weight:400;color:var(--mut)">Copy role permissions between companies/servers</span>
-  </button>
-</div>
-
-<!-- Print Template Steps -->
-<div id="printMode">
 <div class="steps">
   <button class="st on" id="s0"><span class="sn">1</span> Setup Sessions</button>
   <div class="sdiv"></div>
@@ -1964,251 +1651,9 @@ const HTML = `<!DOCTYPE html>
     <button class="btn bp" id="btnReset" style="display:none" onclick="goStep(0)">&#8635; New Migration</button>
   </div>
 </div>
-</div><!-- end printMode -->
-
-<!-- Permission Mode -->
-<div id="permMode" style="display:none">
-<div class="steps">
-  <button class="st on" id="ps0"><span class="sn">1</span> Setup Sessions</button>
-  <div class="sdiv"></div>
-  <button class="st" id="ps1"><span class="sn">2</span> Map Roles</button>
-  <div class="sdiv"></div>
-  <button class="st" id="ps2"><span class="sn">3</span> Migrate</button>
 </div>
-<div id="pp0">
-  <div class="howto"><strong>&#128274; Enter server URLs and cookies (same as Print Templates)</strong></div>
-  <div class="g2">
-    <div class="card">
-      <div class="ch"><div class="chc" style="background:var(--src)"></div><div class="cht">Source Server</div><div class="chb" id="pSrcBadge">Not verified</div></div>
-      <div class="cb">
-        <div class="f"><label>Server URL</label><input id="pSrcUrl" type="url" placeholder="https://*.sixorbit.com"/></div>
-        <div class="f"><label>Cookie</label><textarea id="pSrcCookie" placeholder="Paste full Cookie here"></textarea></div>
-        <button class="btn bp bfull" onclick="pVerify('src')">&#10003; Verify Source</button>
-        <div class="srow"><div class="sd" id="pSrcDot"></div><span id="pSrcStat">Not verified</span></div>
-        <div id="pSrcCompanyWrap" style="display:none;margin-top:10px">
-          <div class="f"><label>Company</label>
-            <select id="pSrcCompany" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px"></select>
-          </div>
-        </div>
-        <div class="errbox" id="pSrcErr"></div>
-      </div>
-    </div>
-    <div class="card">
-      <div class="ch"><div class="chc" style="background:var(--dst)"></div><div class="cht">Destination Server</div><div class="chb" id="pDstBadge">Not verified</div></div>
-      <div class="cb">
-        <div class="f"><label>Server URL</label><input id="pDstUrl" type="url" placeholder="https://*.sixorbit.com"/></div>
-        <div class="f"><label>Cookie</label><textarea id="pDstCookie" placeholder="Paste full Cookie here"></textarea></div>
-        <button class="btn bg bfull" onclick="pVerify('dst')">&#10003; Verify Destination</button>
-        <div class="srow"><div class="sd" id="pDstDot"></div><span id="pDstStat">Not verified</span></div>
-        <div id="pDstCompanyWrap" style="display:none;margin-top:10px">
-          <div class="f"><label>Company</label>
-            <select id="pDstCompany" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px"></select>
-          </div>
-        </div>
-        <div class="errbox" id="pDstErr"></div>
-      </div>
-    </div>
-  </div>
-  <div class="ar"><button class="btn bp" onclick="loadRoles()">&#8594; Load Roles</button></div>
-</div>
-<div id="pp1" style="display:none">
-  <div class="card" style="margin-bottom:16px">
-    <div class="ch"><div class="cht">&#128101; Role Mapping — map source roles to destination roles</div></div>
-    <div class="cb">
-      <p style="font-size:12px;color:var(--mut);margin-bottom:16px">For each source role, choose which destination role to copy permissions into. Select "＋ Create New" if the role doesn't exist in destination.</p>
-      <div id="roleMappingTable"></div>
-    </div>
-  </div>
-  <div class="ar">
-    <button class="btn" onclick="pGoStep(0)">&larr; Back</button>
-    <button class="btn bp" onclick="startPermMigrate()">&#8658; Migrate Permissions</button>
-  </div>
-</div>
-<div id="pp2" style="display:none">
-  <div class="card">
-    <div class="ch"><div class="sd" id="pMigDot" style="background:var(--src)"></div><span id="pMigTitle" style="font-weight:600;margin-left:8px">Migrating...</span></div>
-    <div class="cb">
-      <div id="pLogPanel" style="background:#0f1117;color:#a0ffb0;padding:16px;border-radius:8px;font:12px 'DM Mono',monospace;min-height:200px;max-height:400px;overflow-y:auto;white-space:pre-wrap"></div>
-    </div>
-  </div>
-  <div id="pResCard" style="display:none;margin-top:16px"></div>
-  <div class="ar" style="margin-top:16px">
-    <button class="btn" id="pBtnBack2" onclick="pGoStep(1)" disabled>&larr; Back</button>
-    <button class="btn bp" id="pBtnReset" onclick="location.reload()" style="display:none">&#8635; New Migration</button>
-  </div>
-</div>
-</div><!-- end permMode -->
 
 <script>
-// ── MODE SWITCHING ──────────────────────────────────────────────────────────
-function setMode(mode) {
-  document.getElementById('printMode').style.display = mode === 'print' ? '' : 'none';
-  document.getElementById('permMode').style.display  = mode === 'perm'  ? '' : 'none';
-  document.getElementById('modePrint').className = 'modeBtn' + (mode === 'print' ? ' on' : '');
-  document.getElementById('modePerm').className  = 'modeBtn' + (mode === 'perm'  ? ' on' : '');
-}
-
-// ── PERMISSION MODE STATE ────────────────────────────────────────────────────
-const P = { src:{url:'',cookie:'',company:''}, dst:{url:'',cookie:'',company:''}, srcRoles:[], dstRoles:[], mappings:[] };
-
-function pGoStep(n) {
-  [0,1,2].forEach(i => {
-    document.getElementById('pp'+i).style.display = i===n ? '' : 'none';
-    const b = document.getElementById('ps'+i);
-    if (b) { b.className='st'+(i===n?' on':i<n?' done':''); b.querySelector('.sn').textContent=i<n?'✓':i+1; }
-  });
-}
-
-function pSetStat(side, state, msg) {
-  const dot  = document.getElementById('pSrcDot');
-  const stat = document.getElementById('pSrcStat');
-  const badge= document.getElementById('pSrcBadge');
-  const d2   = document.getElementById('pDstDot');
-  const s2   = document.getElementById('pDstStat');
-  const b2   = document.getElementById('pDstBadge');
-  const dot2 = side==='src' ? dot : d2;
-  const stat2= side==='src' ? stat : s2;
-  const badge2=side==='src' ? badge : b2;
-  dot2.className='sd '+state;
-  stat2.textContent=msg;
-  badge2.textContent=state==='ok'?'✓ Verified':state==='er'?'✗ Failed':msg;
-  badge2.style.color=state==='ok'?'var(--dst)':state==='er'?'var(--err)':'';
-}
-
-async function pVerify(side) {
-  console.log('pVerify called', side);
-  const url    = document.getElementById(side==='src'?'pSrcUrl':'pDstUrl').value.trim();
-  const cookie = document.getElementById(side==='src'?'pSrcCookie':'pDstCookie').value.trim();
-  console.log('url:', url, 'cookie length:', cookie.length);
-  if (!url||!cookie){alert('Enter URL and Cookie');return;}
-  P[side].url=url; P[side].cookie=cookie;
-  pSetStat(side,'ld','Verifying...');
-  try {
-    const r = await fetch('/api/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({serverUrl:url,cookies:cookie})});
-    const d = await r.json();
-    if (d.success) {
-      pSetStat(side,'ok','Session active ✓');
-      // Load companies
-      try {
-        const cr = await fetch('/api/companies',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({serverUrl:url,cookies:cookie})});
-        const cd = await cr.json();
-        const wrap = document.getElementById(side==='src'?'pSrcCompanyWrap':'pDstCompanyWrap');
-        const sel  = document.getElementById(side==='src'?'pSrcCompany':'pDstCompany');
-        if (cd.success && cd.companies && cd.companies.length > 0) {
-          sel.innerHTML = '<option value="">-- Select Company --</option>' + cd.companies.map(c=>'<option value="'+c.value+'">'+c.text+'</option>').join('');
-          if (cd.companies.length===1) sel.value=cd.companies[0].value;
-          wrap.style.display='';
-        }
-      } catch(e){}
-    } else {
-      pSetStat(side,'er','Failed');
-      const eb = document.getElementById(side==='src'?'pSrcErr':'pDstErr');
-      eb.style.display=''; eb.textContent='⚠ '+(d.error||'Failed');
-    }
-  } catch(e){ pSetStat(side,'er','Error'); }
-}
-
-async function loadRoles() {
-  const srcUrl=document.getElementById('pSrcUrl').value.trim();
-  const srcCookie=document.getElementById('pSrcCookie').value.trim();
-  const dstUrl=document.getElementById('pDstUrl').value.trim();
-  const dstCookie=document.getElementById('pDstCookie').value.trim();
-  if(!srcUrl||!srcCookie||!dstUrl||!dstCookie){alert('Verify both servers first');return;}
-  P.src={url:srcUrl,cookie:srcCookie,company:document.getElementById('pSrcCompany').value};
-  P.dst={url:dstUrl,cookie:dstCookie,company:document.getElementById('pDstCompany').value};
-
-  const btn=document.querySelector('[onclick="loadRoles()"]');
-  if(btn){btn.innerHTML='<span class="spinner"></span> Loading...';btn.disabled=true;}
-  try {
-    const [sr, dr] = await Promise.all([
-      fetch('/api/permissions/roles',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({serverUrl:srcUrl,cookies:srcCookie,company:P.src.company})}).then(r=>r.json()),
-      fetch('/api/permissions/roles',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({serverUrl:dstUrl,cookies:dstCookie,company:P.dst.company})}).then(r=>r.json())
-    ]);
-    P.srcRoles = sr.roles || [];
-    P.dstRoles = dr.roles || [];
-    renderRoleMapping();
-    pGoStep(1);
-  } catch(e){ alert('Error loading roles: '+e.message); }
-  if(btn){btn.innerHTML='&#8594; Load Roles';btn.disabled=false;}
-}
-
-function renderRoleMapping() {
-  const dst = P.dstRoles;
-  const dstOpts = '<option value="">-- Skip --</option><option value="__new__">＋ Create New</option>' +
-    dst.map(r=>'<option value="'+r.id+'">'+r.name+'</option>').join('');
-
-  const html = '<table style="width:100%;border-collapse:collapse">' +
-    '<thead><tr style="background:var(--bg)"><th style="padding:10px;text-align:left;font-size:12px;font-weight:600;text-transform:uppercase;color:var(--mut)">Source Role</th>' +
-    '<th style="padding:10px;text-align:left;font-size:12px;font-weight:600;text-transform:uppercase;color:var(--mut)">→ Destination Role</th></tr></thead><tbody>' +
-    P.srcRoles.map((r,i) =>
-      '<tr style="border-bottom:1px solid var(--bdr)">' +
-      '<td style="padding:10px;font-weight:500">'+r.name+'</td>' +
-      '<td style="padding:10px"><select id="rm_'+i+'" data-src-id="'+r.id+'" data-src-name="'+r.name+'" onchange="rmChange(this,'+i+')" style="width:100%;padding:8px;border:1px solid var(--bdr);border-radius:6px;font-size:13px">'+dstOpts+'</select>' +
-      '<input type="text" id="rm_new_'+i+'" placeholder="New role name" style="display:none;margin-top:6px;width:100%;padding:7px;border:1px solid var(--bdr);border-radius:6px;font-size:13px" value="'+r.name+'"/>' +
-      '</td></tr>'
-    ).join('') +
-    '</tbody></table>';
-  document.getElementById('roleMappingTable').innerHTML = html;
-}
-
-function rmChange(sel, i) {
-  const inp = document.getElementById('rm_new_'+i);
-  inp.style.display = sel.value==='__new__' ? '' : 'none';
-}
-
-async function startPermMigrate() {
-  // Build role mappings
-  const mappings = [];
-  P.srcRoles.forEach((r,i) => {
-    const sel = document.getElementById('rm_'+i);
-    if (!sel || !sel.value || sel.value==='') return; // skip
-    const createNew = sel.value === '__new__';
-    const dstRoleId   = createNew ? null : sel.value;
-    const dstRoleName = createNew ? (document.getElementById('rm_new_'+i)?.value || r.name) :
-      P.dstRoles.find(dr=>dr.id===sel.value)?.name || '';
-    mappings.push({ srcRoleId:r.id, srcRoleName:r.name, dstRoleId, dstRoleName, createNew });
-  });
-
-  if (!mappings.length) { alert('Please map at least one role'); return; }
-
-  pGoStep(2);
-  document.getElementById('pLogPanel').innerHTML='';
-  document.getElementById('pResCard').style.display='none';
-  document.getElementById('pBtnBack2').disabled=true;
-  document.getElementById('pBtnReset').style.display='none';
-  document.getElementById('pMigTitle').textContent='Migrating permissions...';
-
-  const resp = await fetch('/api/permissions/migrate',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({srcUrl:P.src.url,srcCookies:P.src.cookie,dstUrl:P.dst.url,dstCookies:P.dst.cookie,
-      srcCompany:P.src.company,dstCompany:P.dst.company,roleMappings:mappings})});
-
-  const reader=resp.body.getReader(); const dec=new TextDecoder(); let buf='';
-  let ok=0,fail=0;
-  while(true){
-    const{done,value}=await reader.read(); if(done)break;
-    buf+=dec.decode(value,{stream:true}); const lines=buf.split('\\n'); buf=lines.pop();    for(const line of lines){
-      if(!line.startsWith('data: '))continue;
-      try{
-        const ev=JSON.parse(line.slice(6));
-        if(ev.type==='log'){
-          const p=document.getElementById('pLogPanel');
-          const d=document.createElement('div');
-          d.className='ll '+ev.level; d.textContent=ev.msg; p.appendChild(d); p.scrollTop=p.scrollHeight;
-        } else if(ev.type==='done'){
-          ok=ev.ok; fail=ev.fail;
-          document.getElementById('pMigTitle').textContent='Migration complete';
-          document.getElementById('pBtnBack2').disabled=false;
-          document.getElementById('pBtnReset').style.display='';
-          const rc=document.getElementById('pResCard'); rc.style.display='';
-          const cls=fail===0?'ok':ok===0?'fl':'pw';
-          const icon=fail===0?'🎉':ok===0?'❌':'⚠️';
-          const msg=fail===0?'All permissions copied!':ok===0?'Migration failed':'Partially done';
-          rc.innerHTML='<div class="rc '+cls+'"><div class="ri">'+icon+'</div><div class="rt"><h3>'+msg+'</h3><p>'+ok+' succeeded · '+fail+' failed</p></div></div>';
-        }
-      }catch(e){}
-    }
-  }
-}
 const S={src:{url:'',cookie:''},dst:{url:'',cookie:''},templates:[],sel:new Set()};
 function goStep(n){[0,1,2].forEach(i=>{document.getElementById('p'+i).style.display=i===n?'':'none';const b=document.getElementById('s'+i);b.className='st'+(i===n?' on':i<n?' done':'');b.querySelector('.sn').textContent=i<n?'✓':i+1;});}
 function setStat(side,state,msg){document.getElementById(side+'Dot').className='sd '+state;document.getElementById(side+'Stat').textContent=msg;const b=document.getElementById(side+'Badge');b.textContent=state==='ok'?'✓ Verified':state==='er'?'✗ Failed':msg;b.style.color=state==='ok'?'var(--dst)':state==='er'?'var(--err)':'';}
@@ -2261,18 +1706,34 @@ function renderT(list,q=''){
   const c=document.getElementById('tlist');
   if(!items.length){c.innerHTML='<div class="tempty">No templates found</div>';return;}
   c.innerHTML=items.map(t=>{const sel=S.sel.has(t.id);const active=(t.status||'').toLowerCase().includes('active');
-    const cls='ti'+(sel?' sel':'');
-    const chk=sel?'checked':'';
-    return '<div class="'+cls+'" onclick="togT(\''+t.id+'\',this)"><input type="checkbox" '+chk+' onclick="event.stopPropagation();togT(\''+t.id+'\',this.closest(\'.ti\'))"/><div class="tin"><div class="tn">'+t.templateName+'</div><div class="tm">ID:'+t.id+' · '+t.templateType+'</div></div><div class="'+(active?'ba':'bi')+'">'+( t.status||'?')+'</div></div>';
+    return \`<div class="ti\${sel?' sel':''}" onclick="togT('\${t.id}',this)"><input type="checkbox" \${sel?'checked':''} onclick="event.stopPropagation();togT('\${t.id}',this.closest('.ti'))"/><div class="tin"><div class="tn">\${t.templateName}</div><div class="tm">ID:\${t.id} · \${t.templateType}</div></div><div class="\${active?'ba':'bi'}">\${t.status||'?'}</div></div>\`;
   }).join('');
 }
 function togT(id,el){S.sel.has(id)?S.sel.delete(id):S.sel.add(id);el.classList.toggle('sel',S.sel.has(id));el.querySelector('input').checked=S.sel.has(id);updSel();}
-function updSel(){document.getElementById('tSel').textContent=S.sel.size;const btn=document.getElementById('btnMig');btn.disabled=S.sel.size===0;btn.textContent=S.sel.size?('⇄ Copy '+S.sel.size+' template'+(S.sel.size>1?'s':'')+' to Destination'):'⇄ Copy to Destination';}
+function updSel(){document.getElementById('tSel').textContent=S.sel.size;const btn=document.getElementById('btnMig');btn.disabled=S.sel.size===0;btn.textContent=S.sel.size?\`⇄ Copy \${S.sel.size} template\${S.sel.size>1?'s':''} to Destination\`:'⇄ Copy to Destination';}
+function selAll(){S.templates.forEach(t=>S.sel.add(t.id));renderT(S.templates,document.getElementById('tsearch').value);}
+function deselAll(){S.sel.clear();renderT(S.templates,document.getElementById('tsearch').value);}
+function filterT(){renderT(S.templates,document.getElementById('tsearch').value);}
+function addLog(level,msg){const p=document.getElementById('logPanel');const d=document.createElement('div');d.className='ll '+level;d.textContent=msg;p.appendChild(d);p.scrollTop=p.scrollHeight;}
+async function startMigrate(){
+  const selected=S.templates.filter(t=>S.sel.has(t.id));
+  goStep(2);document.getElementById('logPanel').innerHTML='';document.getElementById('resCard').style.display='none';
+  document.getElementById('btnBack2').disabled=true;document.getElementById('btnReset').style.display='none';
+  document.getElementById('migTitle').textContent='Migrating '+selected.length+' template(s)...';
+  document.getElementById('migProg').textContent='0 / '+selected.length;document.getElementById('pbar').style.width='0%';
+  const resp=await fetch('/api/migrate',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({srcUrl:S.src.url,srcCookies:S.src.cookie,dstUrl:S.dst.url,dstCookies:S.dst.cookie,srcCompany:S.src.company||'',dstCompany:S.dst.company||'',templateIds:selected.map(t=>({id:t.id,name:t.templateName}))})});
+  const reader=resp.body.getReader();const dec=new TextDecoder();let buf='';
+  while(true){const{done,value}=await reader.read();if(done)break;buf+=dec.decode(value,{stream:true});const lines=buf.split('\\n');buf=lines.pop();
+    for(const line of lines){if(!line.startsWith('data: '))continue;try{const ev=JSON.parse(line.slice(6));
+      if(ev.type==='log')addLog(ev.level,ev.msg);
+      else if(ev.type==='progress'){document.getElementById('migProg').textContent=ev.current+' / '+ev.total;document.getElementById('pbar').style.width=Math.round(ev.current/ev.total*100)+'%';}
+      else if(ev.type==='done'){document.getElementById('migTitle').textContent='Migration complete';document.getElementById('pbar').style.width='100%';document.getElementById('btnBack2').disabled=false;document.getElementById('btnReset').style.display='';
+        const cls=ev.fail===0?'ok':ev.ok===0?'fl':'pw',icon=ev.fail===0?'🎉':ev.ok===0?'❌':'⚠️',msg=ev.fail===0?'All templates copied!':ev.ok===0?'Migration failed':'Partially done';
+        const rc=document.getElementById('resCard');rc.style.display='';rc.innerHTML=\`<div class="rc \${cls}"><div class="ri">\${icon}</div><div class="rt"><h3>\${msg}</h3><p>\${ev.ok} succeeded · \${ev.fail} failed · \${ev.total} total</p></div></div>\`;}
+    }catch(e){}}
+  }
+}
 </script>
 </body>
 </html>`;
-
-app.get('/', (req, res) => res.send(HTML));
-
-const PORT = process.env.PORT || 3737;
-app.listen(PORT, () => console.log(`\n  Sixorbit Migrator v6.0 → http://localhost:${PORT}\n`));
