@@ -1,10 +1,8 @@
 [phases.setup]
-nixPkgs = ["nodejs_20", "chromium"]
+nixPkgs = ["nodejs_20"]
 
-[variables]
-PUPPETEER_SKIP_CHROMIUM_DOWNLOAD = "true"
-PUPPETEER_SKIP_DOWNLOAD = "true"
-NODE_ENV = "production"
+[phases.install]
+cmds = ["npm install"]
 
 [start]
-cmd = "bash start.sh"
+cmd = "node server.js"
