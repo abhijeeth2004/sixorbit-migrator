@@ -64,14 +64,30 @@ app.post('/api/verify', async (req, res) => {
 // ── Fetch company list ───────────────────────────────────────────────────────
 app.post('/api/companies', async (req, res) => {
   const { serverUrl, cookies } = req.body;
+  const base = baseUrl(serverUrl);
+
+  // Strategy 1: Direct HTTP POST to fetch company select form (fastest, no browser needed)
+  try {
+    // The switch-company modal loads via POST to ?urlq=admin_user/user
+    const submitValues = ['switch-company-form', 'switch-assign-company-form', 'get-company-list'];
+    for (const sv of submitValues) {
+      try {
+        const resp = await httpGet(`${base}/?urlq=admin_user/user`, cookies, 'POST', `submit=${sv}`);
+        let html = resp.body;
+        try { const j = JSON.parse(html); if (j.data) html = j.data; if (j.success === false) continue; } catch(e) {}
+        const matches = [...html.matchAll(/<option[^>]+value="(\d+)"[^>]*>\s*([^<]+?)\s*<\/option>/gi)];
+        const companies = matches.map(m => ({ value: m[1], text: m[2].trim() })).filter(c => c.value && c.text);
+        if (companies.length > 0) return res.json({ success: true, companies });
+      } catch(e) {}
+    }
+  } catch(e) {}
+
+  // Strategy 2: Puppeteer — click button and intercept AJAX
   let browser, ctx;
   try {
-    browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox','--disable-setuid-sandbox','--ignore-certificate-errors'] });
+    browser = await puppeteer.launch((() => { const o = { headless: true, args: ['--no-sandbox','--disable-setuid-sandbox','--ignore-certificate-errors','--disable-dev-shm-usage','--disable-gpu'] }; if (process.env.PUPPETEER_EXECUTABLE_PATH) o.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH; return o; })());
     ctx = await browser.createBrowserContext();
     const page = await ctx.newPage();
-    const base = baseUrl(serverUrl);
-
-    // Inject cookies
     await page.goto(base, { waitUntil: 'domcontentloaded' });
     const cookieObjs = cookies.split(';').map(c => {
       const [name, ...rest] = c.trim().split('=');
@@ -79,27 +95,25 @@ app.post('/api/companies', async (req, res) => {
     }).filter(c => c.name);
     await page.setCookie(...cookieObjs);
     await page.goto(`${base}/?urlq=home`, { waitUntil: 'networkidle2', timeout: 20000 });
-    await wait(1500);
+    await wait(1000);
 
     if (await page.$('input[type="password"]'))
       return res.json({ success: false, error: 'Session expired' });
 
-    // Get user id from page
+    // Get userId and click button simultaneously
     const userId = await page.evaluate(() => {
       const el = document.querySelector('a.switch-company[data-id]');
       return el ? el.getAttribute('data-id') : '';
     }).catch(() => '');
 
-    // Click switch-company button to load the modal and intercept the response
     const [ajaxResp] = await Promise.all([
-      page.waitForResponse(r => r.url().includes('urlq=') && r.request().method() === 'POST', { timeout: 8000 }).catch(() => null),
+      page.waitForResponse(r => r.url().includes('urlq=') && r.request().method() === 'POST', { timeout: 10000 }).catch(() => null),
       page.evaluate(() => { document.querySelector('a.switch-company')?.click(); })
     ]);
-    await wait(1500);
+    await wait(2000);
 
     let companies = [];
 
-    // Parse from AJAX response
     if (ajaxResp) {
       try {
         const body = await ajaxResp.text().catch(() => '');
@@ -110,7 +124,7 @@ app.post('/api/companies', async (req, res) => {
       } catch(e) {}
     }
 
-    // Fallback: read from modal DOM
+    // Fallback: read modal DOM
     if (!companies.length) {
       await page.waitForSelector('#system-modal-body select', { timeout: 5000 }).catch(() => {});
       companies = await page.evaluate(() => {
@@ -120,7 +134,27 @@ app.post('/api/companies', async (req, res) => {
       });
     }
 
-    res.json({ success: true, companies, userId });
+    // Strategy 3: Use fetch inside browser with credentials
+    if (!companies.length && userId) {
+      companies = await page.evaluate(async (base, uid) => {
+        try {
+          const fd = new URLSearchParams({ submit: 'switch-company-form', user_id: uid });
+          const r = await fetch(`${base}/?urlq=admin_user/user`, {
+            method: 'POST', credentials: 'include',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: fd.toString()
+          });
+          const html = await r.text();
+          const parser = new DOMParser();
+          const doc = parser.parseFromString(html, 'text/html');
+          const sel = doc.querySelector('select');
+          if (sel) return Array.from(sel.options).map(o => ({ value: o.value, text: o.text.trim() })).filter(o => o.value && o.text);
+        } catch(e) {}
+        return [];
+      }, base, userId);
+    }
+
+    res.json({ success: true, companies });
   } catch(e) {
     res.json({ success: false, error: e.message });
   } finally {
@@ -298,14 +332,18 @@ app.post('/api/templates/list', async (req, res) => {
 // Each call launches a FRESH isolated browser instance (like incognito)
 // This is critical for same-URL migrations where company switching must be independent
 async function launchIsolatedBrowser() {
-  return await puppeteer.launch({
+  const launchOpts = {
     headless: true,
     args: [
       '--no-sandbox', '--disable-setuid-sandbox',
       '--disable-dev-shm-usage', '--disable-gpu',
-      '--incognito'  // Extra isolation
+      '--incognito'
     ]
-  });
+  };
+  if (process.env.PUPPETEER_EXECUTABLE_PATH) {
+    launchOpts.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+  }
+  return await puppeteer.launch(launchOpts);
 }
 
 async function newPage(serverUrl, cookieStr) {
@@ -1122,7 +1160,7 @@ app.post('/api/debug-dst', async (req, res) => {
   const { serverUrl, cookies } = req.body;
   let browser, ctx;
   try {
-    browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox','--disable-setuid-sandbox','--ignore-certificate-errors'] });
+    browser = await puppeteer.launch((() => { const o = { headless: true, args: ['--no-sandbox','--disable-setuid-sandbox','--ignore-certificate-errors','--disable-dev-shm-usage','--disable-gpu'] }; if (process.env.PUPPETEER_EXECUTABLE_PATH) o.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH; return o; })());
     ctx = await browser.createBrowserContext();
     const page = await ctx.newPage();
     await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
@@ -1169,7 +1207,7 @@ app.post('/api/debug-dom', async (req, res) => {
   const { serverUrl, cookies } = req.body;
   let browser, ctx;
   try {
-    browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox','--disable-setuid-sandbox','--ignore-certificate-errors'] });
+    browser = await puppeteer.launch((() => { const o = { headless: true, args: ['--no-sandbox','--disable-setuid-sandbox','--ignore-certificate-errors','--disable-dev-shm-usage','--disable-gpu'] }; if (process.env.PUPPETEER_EXECUTABLE_PATH) o.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH; return o; })());
     ctx = await browser.createBrowserContext();
     const page = await ctx.newPage();
     await page.goto(serverUrl, { waitUntil: 'domcontentloaded' });
@@ -1220,7 +1258,7 @@ app.post('/api/screenshot-rows', async (req, res) => {
   const { serverUrl, cookies, templateTypeValue } = req.body;
   let browser, ctx;
   try {
-    browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox','--disable-setuid-sandbox','--ignore-certificate-errors'] });
+    browser = await puppeteer.launch((() => { const o = { headless: true, args: ['--no-sandbox','--disable-setuid-sandbox','--ignore-certificate-errors','--disable-dev-shm-usage','--disable-gpu'] }; if (process.env.PUPPETEER_EXECUTABLE_PATH) o.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH; return o; })());
     ctx = await browser.createBrowserContext();
     const page = await ctx.newPage();
     await page.setViewport({ width: 1400, height: 900 });
@@ -1293,7 +1331,7 @@ app.post('/api/debug-company-page', async (req, res) => {
   const { serverUrl, cookies } = req.body;
   let browser, ctx;
   try {
-    browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox','--disable-setuid-sandbox','--ignore-certificate-errors'] });
+    browser = await puppeteer.launch((() => { const o = { headless: true, args: ['--no-sandbox','--disable-setuid-sandbox','--ignore-certificate-errors','--disable-dev-shm-usage','--disable-gpu'] }; if (process.env.PUPPETEER_EXECUTABLE_PATH) o.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH; return o; })());
     ctx = await browser.createBrowserContext();
     const page = await ctx.newPage();
     const base = baseUrl(serverUrl);
@@ -1339,7 +1377,7 @@ app.post('/api/debug-switch-company', async (req, res) => {
   const { serverUrl, cookies } = req.body;
   let browser, ctx;
   try {
-    browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox','--disable-setuid-sandbox','--ignore-certificate-errors'] });
+    browser = await puppeteer.launch((() => { const o = { headless: true, args: ['--no-sandbox','--disable-setuid-sandbox','--ignore-certificate-errors','--disable-dev-shm-usage','--disable-gpu'] }; if (process.env.PUPPETEER_EXECUTABLE_PATH) o.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH; return o; })());
     ctx = await browser.createBrowserContext();
     const page = await ctx.newPage();
     const base = baseUrl(serverUrl);
