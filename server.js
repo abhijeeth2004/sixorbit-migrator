@@ -66,7 +66,7 @@ app.post('/api/companies', async (req, res) => {
   const { serverUrl, cookies } = req.body;
   let browser, ctx;
   try {
-    browser = await puppeteer.launch((() => { const o = { headless: true, args: ['--no-sandbox','--disable-setuid-sandbox','--ignore-certificate-errors','--disable-dev-shm-usage','--disable-gpu'] }; if (process.env.PUPPETEER_EXECUTABLE_PATH) o.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH; return o; })());
+    browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox','--disable-setuid-sandbox','--ignore-certificate-errors'] });
     ctx = await browser.createBrowserContext();
     const page = await ctx.newPage();
     const base = baseUrl(serverUrl);
@@ -298,18 +298,14 @@ app.post('/api/templates/list', async (req, res) => {
 // Each call launches a FRESH isolated browser instance (like incognito)
 // This is critical for same-URL migrations where company switching must be independent
 async function launchIsolatedBrowser() {
-  const launchOpts = {
+  return await puppeteer.launch({
     headless: true,
     args: [
       '--no-sandbox', '--disable-setuid-sandbox',
       '--disable-dev-shm-usage', '--disable-gpu',
-      '--incognito'
+      '--incognito'  // Extra isolation
     ]
-  };
-  if (process.env.PUPPETEER_EXECUTABLE_PATH) {
-    launchOpts.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
-  }
-  return await puppeteer.launch(launchOpts);
+  });
 }
 
 async function newPage(serverUrl, cookieStr) {
@@ -1126,7 +1122,7 @@ app.post('/api/debug-dst', async (req, res) => {
   const { serverUrl, cookies } = req.body;
   let browser, ctx;
   try {
-    browser = await puppeteer.launch((() => { const o = { headless: true, args: ['--no-sandbox','--disable-setuid-sandbox','--ignore-certificate-errors','--disable-dev-shm-usage','--disable-gpu'] }; if (process.env.PUPPETEER_EXECUTABLE_PATH) o.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH; return o; })());
+    browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox','--disable-setuid-sandbox','--ignore-certificate-errors'] });
     ctx = await browser.createBrowserContext();
     const page = await ctx.newPage();
     await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
@@ -1173,7 +1169,7 @@ app.post('/api/debug-dom', async (req, res) => {
   const { serverUrl, cookies } = req.body;
   let browser, ctx;
   try {
-    browser = await puppeteer.launch((() => { const o = { headless: true, args: ['--no-sandbox','--disable-setuid-sandbox','--ignore-certificate-errors','--disable-dev-shm-usage','--disable-gpu'] }; if (process.env.PUPPETEER_EXECUTABLE_PATH) o.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH; return o; })());
+    browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox','--disable-setuid-sandbox','--ignore-certificate-errors'] });
     ctx = await browser.createBrowserContext();
     const page = await ctx.newPage();
     await page.goto(serverUrl, { waitUntil: 'domcontentloaded' });
@@ -1224,7 +1220,7 @@ app.post('/api/screenshot-rows', async (req, res) => {
   const { serverUrl, cookies, templateTypeValue } = req.body;
   let browser, ctx;
   try {
-    browser = await puppeteer.launch((() => { const o = { headless: true, args: ['--no-sandbox','--disable-setuid-sandbox','--ignore-certificate-errors','--disable-dev-shm-usage','--disable-gpu'] }; if (process.env.PUPPETEER_EXECUTABLE_PATH) o.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH; return o; })());
+    browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox','--disable-setuid-sandbox','--ignore-certificate-errors'] });
     ctx = await browser.createBrowserContext();
     const page = await ctx.newPage();
     await page.setViewport({ width: 1400, height: 900 });
@@ -1297,7 +1293,7 @@ app.post('/api/debug-company-page', async (req, res) => {
   const { serverUrl, cookies } = req.body;
   let browser, ctx;
   try {
-    browser = await puppeteer.launch((() => { const o = { headless: true, args: ['--no-sandbox','--disable-setuid-sandbox','--ignore-certificate-errors','--disable-dev-shm-usage','--disable-gpu'] }; if (process.env.PUPPETEER_EXECUTABLE_PATH) o.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH; return o; })());
+    browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox','--disable-setuid-sandbox','--ignore-certificate-errors'] });
     ctx = await browser.createBrowserContext();
     const page = await ctx.newPage();
     const base = baseUrl(serverUrl);
@@ -1343,7 +1339,7 @@ app.post('/api/debug-switch-company', async (req, res) => {
   const { serverUrl, cookies } = req.body;
   let browser, ctx;
   try {
-    browser = await puppeteer.launch((() => { const o = { headless: true, args: ['--no-sandbox','--disable-setuid-sandbox','--ignore-certificate-errors','--disable-dev-shm-usage','--disable-gpu'] }; if (process.env.PUPPETEER_EXECUTABLE_PATH) o.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH; return o; })());
+    browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox','--disable-setuid-sandbox','--ignore-certificate-errors'] });
     ctx = await browser.createBrowserContext();
     const page = await ctx.newPage();
     const base = baseUrl(serverUrl);
