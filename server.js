@@ -66,28 +66,21 @@ app.post('/api/companies', async (req, res) => {
   const { serverUrl, cookies } = req.body;
   const base = baseUrl(serverUrl);
 
-  // Extract user-id from cookies (Sixorbit stores it as "user-id=XXXXXXX")
-  const userIdMatch = cookies.match(/user-id=(\d+)/);
-  const userId = userIdMatch ? userIdMatch[1] : '';
-
-  // Strategy 1: Direct HTTP POST using exact Sixorbit switch-company endpoint
-  if (userId) {
-    try {
-      const postBody = `user_hidden_id=${userId}&submit=switch-assign-company-submit&company=`;
-      const resp = await httpGet(`${base}/?urlq=home`, cookies, 'POST', postBody);
-      let html = resp.body;
-      // Also try the admin_user/user endpoint
-      const resp2 = await httpGet(`${base}/?urlq=admin_user/user`, cookies, 'POST', `submit=switch-company-form&user_id=${userId}`);
-      let html2 = resp2.body;
-      for (const html3 of [html2, html]) {
-        let h = html3;
-        try { const j = JSON.parse(h); if (j.data) h = j.data; } catch(e) {}
-        const matches = [...h.matchAll(/<option[^>]+value="(\d+)"[^>]*>\s*([^<]+?)\s*<\/option>/gi)];
+  // Strategy 1: Direct HTTP POST to fetch company select form (fastest, no browser needed)
+  try {
+    // The switch-company modal loads via POST to ?urlq=admin_user/user
+    const submitValues = ['switch-company-form', 'switch-assign-company-form', 'get-company-list'];
+    for (const sv of submitValues) {
+      try {
+        const resp = await httpGet(`${base}/?urlq=admin_user/user`, cookies, 'POST', `submit=${sv}`);
+        let html = resp.body;
+        try { const j = JSON.parse(html); if (j.data) html = j.data; if (j.success === false) continue; } catch(e) {}
+        const matches = [...html.matchAll(/<option[^>]+value="(\d+)"[^>]*>\s*([^<]+?)\s*<\/option>/gi)];
         const companies = matches.map(m => ({ value: m[1], text: m[2].trim() })).filter(c => c.value && c.text);
-        if (companies.length > 1) return res.json({ success: true, companies });
-      }
-    } catch(e) {}
-  }
+        if (companies.length > 0) return res.json({ success: true, companies });
+      } catch(e) {}
+    }
+  } catch(e) {}
 
   // Strategy 2: Puppeteer — click button and intercept AJAX
   let browser, ctx;
@@ -113,24 +106,21 @@ app.post('/api/companies', async (req, res) => {
       return el ? el.getAttribute('data-id') : '';
     }).catch(() => '');
 
-    // Collect ALL POST responses after button click
-    const responses = [];
-    const listener = r => { if (r.request().method() === 'POST') responses.push(r); };
-    page.on('response', listener);
-    await page.evaluate(() => { document.querySelector('a.switch-company')?.click(); });
-    await wait(3000);
-    page.off('response', listener);
+    const [ajaxResp] = await Promise.all([
+      page.waitForResponse(r => r.url().includes('urlq=') && r.request().method() === 'POST', { timeout: 10000 }).catch(() => null),
+      page.evaluate(() => { document.querySelector('a.switch-company')?.click(); })
+    ]);
+    await wait(2000);
 
     let companies = [];
 
-    for (const ajaxResp of responses) {
+    if (ajaxResp) {
       try {
         const body = await ajaxResp.text().catch(() => '');
         let html = body;
         try { const j = JSON.parse(body); if (j.data) html = j.data; } catch(e) {}
         const matches = [...html.matchAll(/<option[^>]+value="(\d+)"[^>]*>\s*([^<]+?)\s*<\/option>/gi)];
-        const found = matches.map(m => ({ value: m[1], text: m[2].trim() })).filter(c => c.value && c.text);
-        if (found.length > companies.length) companies = found;
+        companies = matches.map(m => ({ value: m[1], text: m[2].trim() })).filter(c => c.value && c.text);
       } catch(e) {}
     }
 
